@@ -221,7 +221,10 @@ def build_fallback_summary(events, tasks, notes):
 
 
 def send_telegram_message(text):
-    """Send the briefing to Telegram, with one retry on transient failures."""
+    """Send the briefing to Telegram, with one retry on transient failures.
+
+    Returns the sent message's id, used afterwards to pin it.
+    """
     bot_token = require_env("TELEGRAM_BOT_TOKEN")
     chat_id = require_env("TELEGRAM_CHAT_ID")
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -231,12 +234,47 @@ def send_telegram_message(text):
         try:
             response = requests.post(url, json=payload, timeout=15)
             response.raise_for_status()
-            return
+            return response.json()["result"]["message_id"]
         except requests.RequestException as exc:
             log.warning("Telegram send attempt %d failed: %s", attempt, exc)
 
     log.error("Telegram send failed after retry — the briefing was not delivered.")
     sys.exit(1)
+
+
+def pin_telegram_message(message_id):
+    """Pin today's briefing so MacroDroid can fetch it via getChat.
+
+    getUpdates only returns messages sent TO the bot, never the bot's own
+    outgoing messages — pinning is the reliable way to make an outgoing
+    message fetchable via a simple GET request. Unpinning everything else
+    first keeps the chat's pinned-message list from accumulating old
+    briefings; a failure here is logged but not fatal, since the message
+    was already delivered via sendMessage regardless.
+    """
+    bot_token = require_env("TELEGRAM_BOT_TOKEN")
+    chat_id = require_env("TELEGRAM_CHAT_ID")
+
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{bot_token}/unpinAllChatMessages",
+            json={"chat_id": chat_id},
+            timeout=15,
+        )
+        response = requests.post(
+            f"https://api.telegram.org/bot{bot_token}/pinChatMessage",
+            json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                # Avoids a second "message pinned" notification on top of
+                # the briefing notification you already got from sendMessage.
+                "disable_notification": True,
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        log.warning("Could not pin today's briefing (%s) — MacroDroid's getChat pull may not update.", exc)
 
 
 def main():
@@ -256,8 +294,9 @@ def main():
     prompt = build_prompt(events, tasks, notes)
     summary = summarize_with_gemini(prompt) or build_fallback_summary(events, tasks, notes)
 
-    send_telegram_message(summary)
-    log.info("Briefing sent successfully.")
+    message_id = send_telegram_message(summary)
+    pin_telegram_message(message_id)
+    log.info("Briefing sent and pinned successfully.")
 
 
 if __name__ == "__main__":
